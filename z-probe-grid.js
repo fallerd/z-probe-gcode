@@ -1,3 +1,7 @@
+// deprecated: produces gcode for z probing; since integrated into z-probe-over-lan.js
+// the reason why was because gsender's console is sketchy and getting hundreds of probes out of it seemed difficult or fragile
+// instead created other script to auto parse output and save to csv automatically.
+
 const fs = require('fs');
 const path = require('path');
 

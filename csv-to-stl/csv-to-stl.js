@@ -1,3 +1,5 @@
+// converts heightmap.csv from z-probe-ofer-lan.js to stl file
+
 const fs = require('fs');
 const { parse } = require('csv-parse/sync');
 

@@ -1,3 +1,5 @@
+// connects via lan to altmill, sends gcode to do z probing over a grid area per config below
+
 const net = require('net');
 const fs = require('fs');
 
