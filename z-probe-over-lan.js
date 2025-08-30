@@ -1,5 +1,5 @@
 // connects via lan to altmill, sends gcode to do z probing over a grid area per config below
-// can manually get onto machine with 'telnet 192.168.5.1 23' and then get settings etc with "$$" and "??"
+// can manually get onto machine with 'telnet 192.168.5.1 23' and then get settings etc with "$$" and "?", or manually send gcode commands for testing
 
 const net = require('net');
 const fs = require('fs');
