@@ -1,4 +1,5 @@
 // connects via lan to altmill, sends gcode to do z probing over a grid area per config below
+// can manually get onto machine with 'telnet 192.168.5.1 23' and then get settings etc with "$$" and "??"
 
 const net = require('net');
 const fs = require('fs');
@@ -9,13 +10,14 @@ const port = 23;
 
 const xStart = 0;
 const yStart = 0;
-const xEnd = 100;
-const yEnd = 60;
-const xStep = 10;
-const yStep = 10;
+const xEnd = 50;
+const yEnd = 50;
+const xStep = 2.5;
+const yStep = xStep;
 const zProbeDepth = -20;
-const zRetract = 15;
-const feed = 1000;
+const zRetract = 20;
+const feed = 2000; // mm/min
+const retractFeed = 15000; // xy rapid speed specified (z capped at 6000)
 
 let socket = new net.Socket();
 let csv = 'X,Y,Z\n';
@@ -29,20 +31,82 @@ let initializing = true;
 
 function generateCommands() {
     let commands = [
-        'G92 X0 Y0',     // Set current position as new origin // todo decide what to do about this
-        'G21',
-        'G90',
-        `G0 Z${zRetract}`
+        'G92 X0 Y0 Z0',        // Set current position as origin
+        'G21',                 // Set units to mm
+        'G90',                 // Absolute positioning
+        `G0 Z${zRetract}`      // Retract to safe Z height
     ];
 
+    let yValues = [];
     for (let y = yStart; y <= yEnd; y += yStep) {
-        for (let x = xStart; x <= xEnd; x += xStep) {
-            commands.push(`G0 X${x} Y${y}`);
+        yValues.push(y);
+    }
+
+    let xValues = [];
+    for (let x = xStart; x <= xEnd; x += xStep) {
+        xValues.push(x);
+    }
+
+    // Start at first probe point
+    commands.push(`G0 X${xValues[0]} Y${yValues[0]}`);
+
+    for (let row = 0; row < yValues.length; row++) {
+        let y = yValues[row];
+
+        // Determine X traversal direction for snake path
+        let rowXValues = (row % 2 === 0) ? xValues : [...xValues].reverse();
+
+        for (let col = 0; col < rowXValues.length; col++) {
+            let x = rowXValues[col];
+
+            // Probe at current point
             commands.push(`G38.2 Z${zProbeDepth} F${feed}`);
             commands.push(`G92 Z0`);
-            commands.push(`G0 Z${zRetract}`);
+
+            let isLastPoint = (row === yValues.length - 1) && (col === rowXValues.length - 1);
+            if (!isLastPoint) {
+                commands.push(`G0 Z${zRetract}`);
+            }
+
+            if (!isLastPoint) {
+                let nextX, nextY;
+
+                if (col < rowXValues.length - 1) {
+                    // Next point in same row
+                    nextX = rowXValues[col + 1];
+                    nextY = y;
+
+                    let dx = nextX - x;
+                    let r = Math.abs(dx / 2);
+
+                    commands.push('G18');  // XZ plane
+
+                    // Determine arc direction based on motion
+                    let arcDir = (dx > 0) ? 'G3' : 'G2';
+                    commands.push(`${arcDir} X${nextX} Z${zRetract} R${r} F${retractFeed}`);
+
+                    commands.push('G17');  // Back to XY
+                } else {
+                    // Move to start of next row
+                    nextY = yValues[row + 1];
+                    nextX = ((row + 1) % 2 === 0) ? xValues[0] : xValues[xValues.length - 1];
+
+                    let dy = nextY - y;
+                    let r = Math.abs(dy / 2);
+
+                    commands.push('G19');  // YZ plane
+
+                    // Always bulge up → use G2
+                    commands.push(`G2 Y${nextY} Z${zRetract} R${r} F${retractFeed}`);
+
+                    commands.push('G17');  // Back to XY
+                }
+            }
         }
     }
+
+    // Final retract
+    commands.push(`G0 Z${zRetract}`);
 
     return commands;
 }
