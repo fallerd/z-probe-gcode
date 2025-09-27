@@ -1,4 +1,5 @@
 // connects via lan to altmill, sends gcode to do z probing over a grid area per config below
+// turn on spindle, altmill, clear e stop, run.
 // can manually get onto machine with 'telnet 192.168.5.1 23' and then get settings etc with "$$" and "?", or manually send gcode commands for testing
 
 const net = require('net');
@@ -8,16 +9,17 @@ const fs = require('fs');
 const host = '192.168.5.1';
 const port = 23;
 
-const xStart = 0;
-const yStart = 0;
-const xEnd = 50;
-const yEnd = 50;
-const xStep = 2.5;
+const xStart = 3;
+const yStart = 5;
+const xEnd = 204;
+const yEnd = 790;
+const xStep = 19;
 const yStep = xStep;
-const zProbeDepth = -20;
-const zRetract = 20;
-const feed = 2000; // mm/min
+const zProbeDepth = -8; // negative
+const zRetract = 15;
+const feed = 5000; // mm/min
 const retractFeed = 15000; // xy rapid speed specified (z capped at 6000)
+const missedProbeHeight = -100;
 
 let socket = new net.Socket();
 let csv = 'X,Y,Z\n';
@@ -28,13 +30,15 @@ let secondStartupReceived = false;
 let unlocked = false;
 let softResetSent = false;
 let initializing = true;
+let alarmState = false;
 
 function generateCommands() {
     let commands = [
         'G92 X0 Y0 Z0',        // Set current position as origin
         'G21',                 // Set units to mm
         'G90',                 // Absolute positioning
-        `G0 Z${zRetract}`      // Retract to safe Z height
+        `G0 Z${zRetract}`,      // Retract to safe Z height
+        'G18' // set xz plane for hops
     ];
 
     let yValues = [];
@@ -61,7 +65,7 @@ function generateCommands() {
 
             // Probe at current point
             commands.push(`G38.2 Z${zProbeDepth} F${feed}`);
-            commands.push(`G92 Z0`);
+            commands.push(`G4 P0.05`); // dwell 50 ms to allow machine to settle
 
             let isLastPoint = (row === yValues.length - 1) && (col === rowXValues.length - 1);
             if (!isLastPoint) {
@@ -79,13 +83,10 @@ function generateCommands() {
                     let dx = nextX - x;
                     let r = Math.abs(dx / 2);
 
-                    commands.push('G18');  // XZ plane
-
                     // Determine arc direction based on motion
                     let arcDir = (dx > 0) ? 'G3' : 'G2';
                     commands.push(`${arcDir} X${nextX} Z${zRetract} R${r} F${retractFeed}`);
 
-                    commands.push('G17');  // Back to XY
                 } else {
                     // Move to start of next row
                     nextY = yValues[row + 1];
@@ -97,9 +98,9 @@ function generateCommands() {
                     commands.push('G19');  // YZ plane
 
                     // Always bulge up → use G2
-                    commands.push(`G2 Y${nextY} Z${zRetract} R${r} F${retractFeed}`);
+                    commands.push(`G2 Y${nextY} Z${zRetract} R${r} F${retractFeed}`); /////////////todo somehow machine thinks this is bad code.
 
-                    commands.push('G17');  // Back to XY
+                    commands.push('G18');  // Back to XY
                 }
             }
         }
@@ -147,12 +148,13 @@ function initialize(line) {
         return;
     }
             
-    if (secondStartupReceived && !unlocked && line === 'ok') {
+    if (secondStartupReceived && !unlocked && (line === 'ok' || line === '[MSG:Caution: Unlocked]')) {
         unlocked = true;
         initializing = false;
         console.log('🔓 Unlocked. Starting probe sequence...');
         commandQueue = generateCommands(); // 4. Begin probing
-        setTimeout(sendNextCommand, 100);
+
+        setTimeout(sendNextCommand, 25);
         return;
     }
 }
@@ -161,6 +163,12 @@ function initialize(line) {
 socket.connect(port, host, () => {
     console.log(`🌐 Connected to GRBL-HAL at ${host}:${port}`);
 });
+
+// Debug commands - comment connection above, uncomment this
+// commandQueue = generateCommands();
+// for (let i=0; i<40;i++) {
+//     console.log(commandQueue[i])
+// }
 
 socket.on('data', (data) => {
     const lines = data.toString().split('\n').map(l => l.trim()).filter(Boolean);
@@ -173,18 +181,51 @@ socket.on('data', (data) => {
             return;
         } else if (!unlocked) continue;
 
+        if (line.startsWith('[MSG:Caution: Unlocked]')) {
+            alarmState = false;
+        }
+
         if (line.startsWith('[PRB:')) {
-            let match = line.match(/\[PRB:([\d\.\-]+),([\d\.\-]+),([\d\.\-]+),([\d\.\-]+):1\]/);
+            let match = line.match(/\[PRB:([\d\.\-]+),([\d\.\-]+),([\d\.\-]+),([\d\.\-]+):([01])\]/);
             if (match) {
-                let [, x, y, z, a] = match;
+                let [, x, y, z, a, flag] = match;
+                if (flag === '0') {
+                    // Probe failed
+                    z = missedProbeHeight;
+                    console.log(`    ❌ Missed probe at X=${x}, Y=${y}`);
+                } else {
+                    // Probe successful — set Z = 0
+                    commandQueue.unshift('G92 Z0');
+                    console.log(`    ✅ Successful probe, height reset`);
+                }
                 console.log(`    Captured probe: X=${x}, Y=${y}, Z=${z}`);
                 csv += `${x},${y},${z}\n`;
+            } else {
+                console.log("probe line not recorded, didn't match regex")
             }
             continue;
         }
 
-        if (line === 'ok' || line.startsWith('error')) {
-            setTimeout(sendNextCommand, 50);
+        if (line.startsWith('ALARM')) {
+            alarmState = true
+            if (line === "ALARM:5") {
+                setTimeout(() => {
+                    console.log(`>> ⚠️ GRBL Alarm: ${line} — initiating recovery...`);
+                    socket.write('$X\n');
+                }, 25)
+            }
+            if (line === "ALARM:10") {
+                console.log ("E-STOP")
+                socket.destroy();
+                return;
+            }
+            continue;
+        }
+
+        // if ((line === 'ok' || line.startsWith('error')) && !alarmState) {
+        if ((line === 'ok') && !alarmState) {
+
+            setTimeout(sendNextCommand, 25);
         }
     }
 });
